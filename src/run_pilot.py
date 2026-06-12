@@ -14,7 +14,7 @@ from .evaluate import write_evaluation_outputs
 from .features import add_volatility_features, time_series_feature_columns
 from .load_data import load_fintexts
 from .models import make_ridge_model, make_supervised_model
-from .text_features import add_text_presence_flags, detect_text_columns, make_text_features
+from .text_features import add_text_presence_flags, detect_text_columns, make_text_features, write_text_schema_validation
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,7 +101,7 @@ def build_predictions(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame,
     records.append(ts)
 
     text_columns_seen: dict[str, list[str]] = {}
-    for mode in ["all_text", "target_sector_text", "levelwise_text"]:
+    for mode in ["news_all", "target_sector", "levelwise_news"]:
         matrix, names, text_columns_seen = make_text_features(
             df,
             mode=mode,
@@ -179,8 +179,9 @@ def main() -> None:
     needed = ts_features + ["target", "logGKVol"]
     df = df.dropna(subset=needed).copy().reset_index(drop=False).rename(columns={"index": "row_id"})
 
+    write_text_schema_validation(df, output_dir)
     text_columns = detect_text_columns(df)
-    df = add_text_presence_flags(df, text_columns)
+    df = add_text_presence_flags(df, text_columns, ticker_col=column_map.ticker)
 
     train, val, test = split_by_time(df, column_map.ticker, column_map.date)
     train_full = pd.concat([train, val], ignore_index=False)

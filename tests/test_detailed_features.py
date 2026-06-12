@@ -5,7 +5,13 @@ import pandas as pd
 
 from src.features import add_detailed_volatility_targets, add_volatility_features, target_column_for
 from src.load_data import ColumnMap
-from src.text_features import train_only_pca_features
+from src.text_features import (
+    combine_text_columns,
+    joined_text_for_configuration,
+    normalize_text_value,
+    text_columns_for_configuration,
+    train_only_pca_features,
+)
 
 
 def _sample_prices() -> tuple[pd.DataFrame, ColumnMap]:
@@ -59,3 +65,57 @@ def test_text_shift_alignment_can_be_computed_without_future_rows() -> None:
     df = pd.DataFrame({"ticker": ["A", "A", "A"], "has_text_target": [1, 0, 1]})
     shifted = df.groupby("ticker", sort=False)[["has_text_target"]].shift(1).fillna(0)
     assert shifted["has_text_target"].tolist() == [0, 1, 0]
+
+
+def test_normalize_text_value_removes_missing_literals() -> None:
+    assert normalize_text_value(None) == ""
+    assert normalize_text_value(np.nan) == ""
+    assert normalize_text_value(pd.NA) == ""
+    assert normalize_text_value(" None ") == ""
+    assert normalize_text_value("nan") == ""
+    assert normalize_text_value("NULL") == ""
+    assert normalize_text_value("  real news  ") == "real news"
+
+
+def test_combine_text_columns_drops_empty_and_exact_duplicates() -> None:
+    row = pd.Series({"a": " headline ", "b": None, "c": "headline", "d": "None", "e": "second"})
+    assert combine_text_columns(row, ["a", "b", "c", "d", "e"], separator="|") == "headline|second"
+
+
+def test_news_all_excludes_filing_columns() -> None:
+    text_columns = {
+        "macro": ["macro_category1"],
+        "sector": ["sector_category1"],
+        "related": ["relatedCompany_category1"],
+        "target": ["targetCompany_category1"],
+        "filing": ["filing_financialStatement"],
+    }
+    assert text_columns_for_configuration(text_columns, "news_all") == [
+        "macro_category1",
+        "sector_category1",
+        "relatedCompany_category1",
+        "targetCompany_category1",
+    ]
+    assert text_columns_for_configuration(text_columns, "news_plus_filing")[-1] == "filing_financialStatement"
+
+
+def test_joined_text_configuration_does_not_emit_none_tokens() -> None:
+    df = pd.DataFrame(
+        {
+            "macro_category1": ["None"],
+            "sector_category1": [None],
+            "relatedCompany_category1": ["nan"],
+            "targetCompany_category1": ["target news"],
+            "filing_financialStatement": ["filing context"],
+        }
+    )
+    text_columns = {
+        "macro": ["macro_category1"],
+        "sector": ["sector_category1"],
+        "related": ["relatedCompany_category1"],
+        "target": ["targetCompany_category1"],
+        "filing": ["filing_financialStatement"],
+    }
+    assert joined_text_for_configuration(df, text_columns, "news_all").iloc[0] == "target news"
+    assert "filing context" not in joined_text_for_configuration(df, text_columns, "news_all").iloc[0]
+    assert "filing context" in joined_text_for_configuration(df, text_columns, "news_plus_filing").iloc[0]

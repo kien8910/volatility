@@ -44,6 +44,13 @@ python -m src.run_pilot \
 
 The detailed mode checks whether FinTexTS news has predictive association in specific tickers, event days, text levels, targets, and horizons. It keeps the original pilot outputs and adds ticker-level metrics, text-level ablations, event/spike diagnostics, placebo tests, alignment sensitivity, and an automatic report.
 
+Text handling uses the explicit FinTexTS schema:
+
+- News: `macro_category1..5`, `sector_category1..5`, `targetCompany_category1..3`, `relatedCompany_category1..3`
+- Filing context: `filing_financialStatement`, `filing_governanceRisks`, `filing_overviewProduct`, `filing_recentEventCatalyst`, `filing_strategyMarketOps`
+
+`news_all` means macro + sector + related company + target company only. Filing context is separate and appears only in `filing_only`, `news_plus_filing`, or `levelwise_news_plus_filing`.
+
 Quick 5-ticker run:
 
 ```bash
@@ -90,6 +97,12 @@ Detailed mode writes stable-schema outputs including:
 - `outputs/detailed_signal/statistical_tests.csv`
 - `outputs/detailed_signal/walk_forward_results.csv`
 - `outputs/detailed_signal/news_signal_report.md`
+- `outputs/detailed_signal/text_schema_validation.json`
+- `outputs/detailed_signal/filing_context_diagnostics.csv`
+- `outputs/detailed_signal/text_duplicate_diagnostics.csv`
+- `outputs/detailed_signal/corrected_text_column_ablation.csv`
+- `outputs/detailed_signal/corrected_text_column_ablation_by_ticker.csv`
+- `outputs/detailed_signal/text_column_usage_report.md`
 
 The report gives a conservative recommendation: `proceed_with_agents`, `run_larger_pilot`, `revise_target_or_alignment`, or `stop_agent_development`. It does not claim that news helps unless the diagnostics support that.
 
@@ -122,7 +135,7 @@ Detailed mode also creates:
 
 If TS + text models reduce MAE or RMSE compared with `TS_only_lags`, FinTexTS text likely contains useful volatility signal.
 
-If `all_text` performs worse than `target_sector_text`, broad text context may be noisy and future work should filter text more aggressively.
+If `news_all` performs worse than `target_sector`, broad news context may be noisy and future work should filter text more aggressively.
 
 If text does not improve results, it is probably premature to build a full Reasoning Agent or Reflection Agent around this dataset before improving alignment, filtering, or target construction.
 

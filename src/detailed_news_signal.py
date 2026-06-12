@@ -26,7 +26,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from .config import EVENT_KEYWORDS, RANDOM_SEED, TEXT_CONFIGURATIONS
+from .config import EVENT_KEYWORDS, RANDOM_SEED
 from .evaluate import write_evaluation_outputs
 from .features import add_detailed_volatility_targets, add_volatility_features, target_column_for, time_series_feature_columns
 from .load_data import ColumnMap, load_fintexts
@@ -36,14 +36,19 @@ from .text_features import (
     add_text_presence_flags,
     detect_text_columns,
     encode_text_raw,
+    filing_context_diagnostics,
     joined_text_for_configuration,
     keyword_filtered_text,
+    normalize_text_value,
+    text_duplicate_diagnostics,
     text_columns_for_configuration,
     train_only_pca_features,
+    write_text_schema_validation,
 )
 
 
 NEWS_LEVELS = ["macro", "sector", "related", "target"]
+FILING_LEVELS = NEWS_LEVELS + ["filing"]
 DEFAULT_BASELINE = "TS_only_lags"
 
 
@@ -79,6 +84,15 @@ def split_by_time(df: pd.DataFrame, ticker_col: str, date_col: str) -> tuple[pd.
 
 def _safe_name(value: object) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in str(value))
+
+
+def _row_identity(df: pd.DataFrame, args=None) -> pd.Series:
+    preferred = [col for col in ["ticker", "symbol", "date", "datetime", "trading_date"] if col in df.columns]
+    if len(preferred) >= 2:
+        return df[preferred].astype(str).agg("|".join, axis=1)
+    if {"row_id"}.issubset(df.columns):
+        return df["row_id"].astype(str)
+    return pd.Series([str(idx) for idx in df.index], index=df.index)
 
 
 def _paired_tests(model_abs: np.ndarray, baseline_abs: np.ndarray) -> dict[str, float]:
@@ -172,19 +186,21 @@ def _build_embedding_columns(
     if configuration == "no_text":
         return df.copy(), [], None
     try:
-        if configuration == "levelwise_text":
+        if configuration in {"levelwise_news", "levelwise_news_plus_filing"}:
             frames = []
             names: list[str] = []
-            for level in NEWS_LEVELS:
+            levels = NEWS_LEVELS if configuration == "levelwise_news" else FILING_LEVELS
+            identity = _row_identity(df, args)
+            for level in levels:
                 text = joined_text_for_configuration(df, text_columns, f"{level}_only")
-                raw = encode_text_raw(text, args.embedding_model, suffix=f"{configuration}_{level}")
+                raw = encode_text_raw(text, args.embedding_model, suffix=f"{configuration}_{level}", row_identity=identity)
                 emb_df, emb_names = train_only_pca_features(raw, train_index, args.pca_dim, f"{level}", RANDOM_SEED)
                 frames.append(emb_df)
                 names.extend(emb_names)
             emb = pd.concat(frames, axis=1)
         else:
             text = joined_text_for_configuration(df, text_columns, configuration)
-            raw = encode_text_raw(text, args.embedding_model, suffix=configuration)
+            raw = encode_text_raw(text, args.embedding_model, suffix=configuration, row_identity=_row_identity(df, args))
             emb, names = train_only_pca_features(raw, train_index, args.pca_dim, configuration, RANDOM_SEED)
         out = pd.concat([df.reset_index(drop=True), emb.reset_index(drop=True)], axis=1)
         return out, names, None
@@ -195,23 +211,28 @@ def _build_embedding_columns(
 def _text_meta_features(configuration: str) -> list[str]:
     if configuration == "no_text":
         return []
-    if configuration == "all_text" or configuration == "levelwise_text":
+    if configuration in {"news_all", "levelwise_news"}:
         levels = NEWS_LEVELS
+    elif configuration in {"news_plus_filing", "levelwise_news_plus_filing"}:
+        levels = FILING_LEVELS
     else:
         cols = {
             "macro_only": ["macro"],
             "sector_only": ["sector"],
             "related_only": ["related"],
             "target_only": ["target"],
-            "macro_sector": ["macro", "sector"],
             "target_sector": ["target", "sector"],
-            "target_related": ["target", "related"],
+            "filing_only": ["filing"],
         }.get(configuration, [])
         levels = cols
     features = []
     for level in levels:
-        features.extend([f"has_text_{level}", f"text_length_{level}"])
-    return features + ["num_text_levels_present", "total_text_length"]
+        if level == "filing":
+            features.extend(["has_filing_context", "filing_context_changed", "filing_text_length_total"])
+        else:
+            features.extend([f"has_text_{level}", f"text_length_{level}"])
+    base = ["num_text_levels_present", "news_text_length_total"]
+    return list(dict.fromkeys(features + base))
 
 
 def build_predictions_for_specs(
@@ -227,9 +248,33 @@ def build_predictions_for_specs(
 ) -> tuple[pd.DataFrame, list[str]]:
     records = []
     notes: list[str] = []
-    configs = ["no_text", "macro_only", "sector_only", "related_only", "target_only", "macro_sector", "target_sector", "target_related", "all_text", "levelwise_text"]
+    configs = [
+        "no_text",
+        "macro_only",
+        "sector_only",
+        "related_only",
+        "target_only",
+        "target_sector",
+        "news_all",
+        "filing_only",
+        "news_plus_filing",
+        "levelwise_news",
+        "levelwise_news_plus_filing",
+    ]
     if getattr(args, "quick_mode", False):
-        configs = ["no_text", "target_only", "target_sector", "all_text", "levelwise_text"]
+        configs = [
+            "no_text",
+            "macro_only",
+            "sector_only",
+            "related_only",
+            "target_only",
+            "target_sector",
+            "news_all",
+            "filing_only",
+            "news_plus_filing",
+            "levelwise_news",
+            "levelwise_news_plus_filing",
+        ]
     embedded: dict[str, tuple[pd.DataFrame, list[str]]] = {}
 
     for config in configs:
@@ -353,14 +398,53 @@ def text_level_ablation(by_ticker: pd.DataFrame, ticker_col: str, output_dir: Pa
     return result
 
 
+def corrected_text_ablation(predictions: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
+    rows = []
+    for (target_name, horizon), target_group in predictions.groupby(["target_name", "horizon"]):
+        baseline = target_group[target_group["model"] == DEFAULT_BASELINE].set_index("row_id")
+        if baseline.empty:
+            continue
+        baseline_abs = (baseline["prediction"] - baseline["target"]).abs()
+        baseline_mse = mean_squared_error(baseline["target"], baseline["prediction"])
+        baseline_mae = mean_absolute_error(baseline["target"], baseline["prediction"])
+        baseline_rmse = float(np.sqrt(baseline_mse))
+        for model, group in target_group.groupby("model"):
+            if model in {"Naive_logGKVol_t", "HAR_Ridge"}:
+                continue
+            config = "no_text" if model == DEFAULT_BASELINE else str(model).replace("TS_plus_", "")
+            mse = mean_squared_error(group["target"], group["prediction"])
+            mae = mean_absolute_error(group["target"], group["prediction"])
+            rmse = float(np.sqrt(mse))
+            aligned = group.set_index("row_id").join(baseline_abs.rename("baseline_abs_error"), how="inner")
+            tests = _paired_tests((aligned["prediction"] - aligned["target"]).abs().to_numpy(), aligned["baseline_abs_error"].to_numpy()) if not aligned.empty else {}
+            rows.append(
+                {
+                    "target_name": target_name,
+                    "horizon": horizon,
+                    "text_configuration": config,
+                    "mae": float(mae),
+                    "rmse": rmse,
+                    "r2": float(r2_score(group["target"], group["prediction"])) if len(group) > 1 else np.nan,
+                    "baseline_mae": float(baseline_mae),
+                    "baseline_rmse": baseline_rmse,
+                    "improvement_vs_ts_only_pct": (baseline_mae - mae) / baseline_mae * 100 if baseline_mae else np.nan,
+                    "paired_test_pvalue": tests.get("paired_test_pvalue", np.nan),
+                    "num_test_samples": int(len(group)),
+                }
+            )
+    result = pd.DataFrame(rows)
+    result.to_csv(output_dir / "corrected_text_column_ablation.csv", index=False)
+    return result
+
+
 def event_day_comparison(predictions: pd.DataFrame, df: pd.DataFrame, ticker_col: str, output_dir: Path) -> pd.DataFrame:
-    flags = ["has_any_text", "has_text_macro", "has_text_sector", "has_text_related", "has_text_target"]
-    aux = df[["row_id", "num_text_levels_present", "total_text_length"] + flags].copy()
+    flags = ["has_any_news_text", "has_text_macro", "has_text_sector", "has_text_related", "has_text_target"]
+    aux = df[["row_id", "num_text_levels_present", "news_text_length_total"] + flags].copy()
     work = predictions.merge(aux, on="row_id", how="left")
-    text_model = "TS_plus_target_sector" if "TS_plus_target_sector" in set(work["model"]) else "TS_plus_all_text"
+    text_model = "TS_plus_target_sector" if "TS_plus_target_sector" in set(work["model"]) else "TS_plus_news_all"
     rows = []
     groups = {
-        "no_text": work["has_any_text"].eq(False),
+        "no_text": work["has_any_news_text"].eq(False),
         "macro_or_sector_only": (work["has_text_macro"] | work["has_text_sector"]) & ~(work["has_text_related"] | work["has_text_target"]),
         "related_company_text": work["has_text_related"],
         "target_company_text": work["has_text_target"],
@@ -429,7 +513,7 @@ def event_day_volatility_stats(df: pd.DataFrame, specs: list[TargetSpec], output
 
 def spike_analysis(predictions: pd.DataFrame, train: pd.DataFrame, df: pd.DataFrame, specs: list[TargetSpec], ticker_col: str, output_dir: Path) -> pd.DataFrame:
     rows = []
-    aux_cols = ["row_id", ticker_col, "has_any_text"] + [f"has_text_{level}" for level in NEWS_LEVELS]
+    aux_cols = ["row_id", ticker_col, "has_any_news_text"] + [f"has_text_{level}" for level in NEWS_LEVELS]
     work = predictions.merge(df[aux_cols], on=["row_id", ticker_col], how="left")
     for spec in specs:
         thresholds = train.groupby(ticker_col)[spec.column].quantile([0.90, 0.95]).unstack()
@@ -457,7 +541,7 @@ def spike_analysis(predictions: pd.DataFrame, train: pd.DataFrame, df: pd.DataFr
                         "rmse": float(np.sqrt(mean_squared_error(subset["target"], subset["prediction"]))),
                         "mean_underprediction": float(under.mean()),
                         "spike_rate": float(y_spike.mean()),
-                        "text_day_rate": float(subset["has_any_text"].mean()),
+                        "text_day_rate": float(subset["has_any_news_text"].mean()),
                         "precision": np.nan,
                         "recall": np.nan,
                         "f1": np.nan,
@@ -580,7 +664,7 @@ def keyword_filter_results(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataF
     for config, (group_name, target_only) in configs.items():
         text = keyword_filtered_text(df, text_columns, group_name, target_only)
         try:
-            raw = encode_text_raw(text, args.embedding_model, suffix=f"keyword_{config}")
+            raw = encode_text_raw(text, args.embedding_model, suffix=f"keyword_{config}", row_identity=_row_identity(df, args))
             emb, emb_cols = train_only_pca_features(raw, train.index, args.pca_dim, config, RANDOM_SEED)
             work = pd.concat([df.reset_index(drop=True), emb.reset_index(drop=True)], axis=1)
         except Exception:
@@ -614,7 +698,7 @@ def text_intensity_analysis(predictions: pd.DataFrame, df: pd.DataFrame, output_
     aux["text_length_quartile"] = pd.qcut(aux["total_text_length"].rank(method="first"), 4, labels=["q1", "q2", "q3", "q4"])
     work = predictions.merge(aux, on="row_id", how="left")
     rows = []
-    text_model = "TS_plus_target_sector" if "TS_plus_target_sector" in set(work["model"]) else "TS_plus_all_text"
+    text_model = "TS_plus_target_sector" if "TS_plus_target_sector" in set(work["model"]) else "TS_plus_news_all"
     for (target_name, horizon, bucket), group in work.groupby(["target_name", "horizon", "text_length_quartile"], observed=False):
         base = group[group["model"] == DEFAULT_BASELINE].set_index("row_id")
         comp = group[group["model"] == text_model].set_index("row_id")
@@ -822,7 +906,7 @@ def plot_outputs(predictions: pd.DataFrame, by_ticker: pd.DataFrame, ablation: p
             plt.close()
 
     if not spike.empty:
-        err = spike[(spike["segment"].isin(["spike", "non_spike"])) & (spike["model"].isin([DEFAULT_BASELINE, "TS_plus_target_sector", "TS_plus_all_text"]))]
+        err = spike[(spike["segment"].isin(["spike", "non_spike"])) & (spike["model"].isin([DEFAULT_BASELINE, "TS_plus_target_sector", "TS_plus_news_all"]))]
         if not err.empty:
             plt.figure(figsize=(10, 5))
             labels = err["model"] + " / " + err["segment"]
@@ -840,7 +924,7 @@ def plot_outputs(predictions: pd.DataFrame, by_ticker: pd.DataFrame, ablation: p
             plt.tight_layout()
             plt.savefig(output_dir / "spike_rate_by_text_level.png", dpi=150)
             plt.close()
-        metrics = spike[(spike["segment"] == "all") & spike["model"].isin([DEFAULT_BASELINE, "TS_plus_target_sector", "TS_plus_all_text"])]
+        metrics = spike[(spike["segment"] == "all") & spike["model"].isin([DEFAULT_BASELINE, "TS_plus_target_sector", "TS_plus_news_all"])]
         if not metrics.empty:
             plt.figure(figsize=(10, 5))
             plt.bar(metrics["model"] + " " + metrics["spike_definition"], metrics["recall"].fillna(0))
@@ -885,17 +969,17 @@ def plot_outputs(predictions: pd.DataFrame, by_ticker: pd.DataFrame, ablation: p
     if not predictions.empty:
         ticker = predictions[ticker_col].iloc[0]
         pred = predictions[predictions[ticker_col] == ticker]
-        models = [DEFAULT_BASELINE, "TS_plus_target_sector", "TS_plus_all_text"]
+        models = [DEFAULT_BASELINE, "TS_plus_target_sector", "TS_plus_news_all"]
         pred = pred[pred["model"].isin(models)]
         if not pred.empty:
-            merged = pred.merge(df[["row_id", "has_text_target", "has_any_text"]], on="row_id", how="left")
+            merged = pred.merge(df[["row_id", "has_text_target", "has_any_news_text"]], on="row_id", how="left")
             plt.figure(figsize=(12, 5))
             actual = merged.drop_duplicates("row_id").sort_values(date_col)
             plt.plot(actual[date_col], actual["target"], label="actual", linewidth=2)
             for model, group in merged.groupby("model"):
                 group = group.sort_values(date_col)
                 plt.plot(group[date_col], group["prediction"], label=model, alpha=0.8)
-            events = actual[actual["has_text_target"].astype(bool) | actual["has_any_text"].astype(bool)].head(20)
+            events = actual[actual["has_text_target"].astype(bool) | actual["has_any_news_text"].astype(bool)].head(20)
             plt.scatter(events[date_col], events["target"], color="black", s=18, label="text/event day")
             plt.legend(fontsize=8)
             plt.xticks(rotation=30, ha="right")
@@ -985,6 +1069,88 @@ def write_report(output_dir: Path, notes: list[str]) -> None:
     (output_dir / "news_signal_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_text_column_usage_report(
+    output_dir: Path,
+    schema_report: dict,
+    text_columns: dict[str, list[str]],
+    df: pd.DataFrame,
+    ablation: pd.DataFrame,
+    filing_diag: pd.DataFrame,
+) -> None:
+    missing = schema_report.get("missing_columns", [])
+    extra = schema_report.get("extra_possible_text_columns", [])
+    counts = {
+        "macro": int(df["has_macro_text"].sum()) if "has_macro_text" in df else 0,
+        "sector": int(df["has_sector_text"].sum()) if "has_sector_text" in df else 0,
+        "related": int(df["has_related_text"].sum()) if "has_related_text" in df else 0,
+        "target": int(df["has_target_text"].sum()) if "has_target_text" in df else 0,
+        "any_news": int(df["has_any_news_text"].sum()) if "has_any_news_text" in df else 0,
+        "filing": int(df["has_filing_context"].sum()) if "has_filing_context" in df else 0,
+        "filing_changed": int(df["filing_context_changed"].sum()) if "filing_context_changed" in df else 0,
+    }
+    length_rows = []
+    for level in NEWS_LEVELS:
+        col = f"text_length_{level}"
+        length_rows.append(f"- {level}: mean={df[col].mean():.2f}, median={df[col].median():.2f}" if col in df else f"- {level}: unavailable")
+    if "filing_text_length_total" in df:
+        length_rows.append(f"- filing: mean={df['filing_text_length_total'].mean():.2f}, median={df['filing_text_length_total'].median():.2f}")
+
+    best_config = "not available"
+    filing_comment = "not available"
+    if not ablation.empty:
+        grouped = ablation.groupby("text_configuration")["improvement_vs_ts_only_pct"].median().sort_values(ascending=False)
+        if len(grouped):
+            best_config = f"{grouped.index[0]} ({grouped.iloc[0]:.3f}% median MAE improvement)"
+        filing_rows = grouped[[idx for idx in grouped.index if "filing" in idx]] if any("filing" in idx for idx in grouped.index) else pd.Series(dtype=float)
+        news_rows = grouped[[idx for idx in grouped.index if idx in {"news_all", "target_sector", "target_only", "levelwise_news"}]] if any(idx in {"news_all", "target_sector", "target_only", "levelwise_news"} for idx in grouped.index) else pd.Series(dtype=float)
+        if not filing_rows.empty and not news_rows.empty:
+            filing_comment = "filing helps more than news median" if filing_rows.max() > news_rows.max() else "filing does not beat the best news-only median"
+    stable_filing = False
+    if not filing_diag.empty and "median_same_content_run_days" in filing_diag:
+        stable_filing = bool(filing_diag["median_same_content_run_days"].fillna(0).max() >= 5)
+
+    lines = [
+        "# Text Column Usage Report",
+        "",
+        "## Explicit Columns",
+        "",
+        f"- Expected text columns: {len(schema_report.get('expected_columns', []))}",
+        f"- Found text columns: {len(schema_report.get('found_columns', []))}",
+        f"- Missing configured columns: {missing if missing else 'none'}",
+        f"- Extra possible text columns outside config: {extra if extra else 'none'}",
+        "",
+        "## Previous Behavior",
+        "",
+        "- Previous code used substring-based detection when `TEXT_COLUMNS` was empty, so it could miss camelCase FinTexTS columns and could include ambiguous text fields.",
+        "- Previous joins used `fillna(\"\").astype(str)` in some paths. That avoided many nulls but still did not centralize handling of literal strings like `None`, `nan`, and `null`.",
+        "- Previous `all_text` meant news columns detected as macro/sector/related/target; filing inclusion depended on detection, so the definition was not explicit enough.",
+        "",
+        "## Corrected Behavior",
+        "",
+        "- Explicit FinTexTS columns are now the primary source; fallback detection only emits warnings.",
+        "- `news_all` is macro + sector + related + target only. It never includes filing.",
+        "- `filing_only` and `news_plus_filing` are explicit filing-aware configurations.",
+        "- Filing is treated as slower-moving company context, not daily news.",
+        f"- Filing appears stable over longer runs: {stable_filing}.",
+        "- Text cache version is `v2_explicit_fintexts_columns`, so old caches built from ambiguous joins are not reused.",
+        "",
+        "## Row Counts",
+        "",
+        *[f"- {key}: {value}" for key, value in counts.items()],
+        "",
+        "## Text Lengths",
+        "",
+        *length_rows,
+        "",
+        "## Ablation Summary",
+        "",
+        f"- Best text configuration: {best_config}",
+        f"- Filing context result: {filing_comment}",
+        "- News and filing should continue to be handled separately unless a larger pilot shows stable benefit from `news_plus_filing`.",
+    ]
+    (output_dir / "text_column_usage_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def run_detailed_news_signal(args) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1000,8 +1166,13 @@ def run_detailed_news_signal(args) -> None:
     df = add_volatility_features(raw, column_map, forecast_horizon=1, max_lag=args.max_lag)
     df = add_detailed_volatility_targets(df, column_map, horizons)
     ts_features = time_series_feature_columns(args.max_lag)
+    schema_report = write_text_schema_validation(df, output_dir)
     text_columns = detect_text_columns(df)
-    df = add_text_presence_flags(df, text_columns)
+    duplicate_diag = text_duplicate_diagnostics(df, text_columns, column_map.ticker, column_map.date)
+    duplicate_diag.to_csv(output_dir / "text_duplicate_diagnostics.csv", index=False)
+    filing_diag = filing_context_diagnostics(df, text_columns, column_map.ticker, column_map.date)
+    filing_diag.to_csv(output_dir / "filing_context_diagnostics.csv", index=False)
+    df = add_text_presence_flags(df, text_columns, ticker_col=column_map.ticker)
     df = add_event_keyword_features(df, text_columns)
     needed = ts_features + ["logGKVol"]
     df = df.dropna(subset=needed).copy().reset_index(drop=False).rename(columns={"index": "row_id"})
@@ -1026,6 +1197,8 @@ def run_detailed_news_signal(args) -> None:
     by_ticker = ticker_metrics(predictions, column_map.ticker, output_dir)
     summary = ticker_improvement_summary(by_ticker, output_dir)
     ablation = text_level_ablation(by_ticker, column_map.ticker, output_dir)
+    corrected_ablation = corrected_text_ablation(predictions, output_dir)
+    ablation.to_csv(output_dir / "corrected_text_column_ablation_by_ticker.csv", index=False)
     event_cmp = event_day_comparison(predictions, df, column_map.ticker, output_dir)
     event_stats = event_day_volatility_stats(df, specs, output_dir)
     spike = spike_analysis(predictions, train_full, df, specs, column_map.ticker, output_dir)
@@ -1049,6 +1222,7 @@ def run_detailed_news_signal(args) -> None:
     walk_forward_results(df, specs, column_map.ticker, column_map.date, ts_features, output_dir)
     plot_outputs(predictions, by_ticker, ablation, spike, lead_lag, placebo, df, column_map.ticker, column_map.date, output_dir)
     write_report(output_dir, notes)
+    write_text_column_usage_report(output_dir, schema_report, text_columns, df, corrected_ablation, filing_diag)
 
     print(f"Detailed outputs written to: {output_dir.resolve()}")
     print("Key files: news_signal_report.md, news_signal_by_ticker.csv, text_level_ablation.csv, volatility_spike_analysis.csv")
