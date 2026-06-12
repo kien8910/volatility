@@ -443,16 +443,21 @@ def event_day_comparison(predictions: pd.DataFrame, df: pd.DataFrame, ticker_col
     work = predictions.merge(aux, on="row_id", how="left")
     text_model = "TS_plus_target_sector" if "TS_plus_target_sector" in set(work["model"]) else "TS_plus_news_all"
     rows = []
-    groups = {
-        "no_text": work["has_any_news_text"].eq(False),
-        "macro_or_sector_only": (work["has_text_macro"] | work["has_text_sector"]) & ~(work["has_text_related"] | work["has_text_target"]),
-        "related_company_text": work["has_text_related"],
-        "target_company_text": work["has_text_target"],
-        "two_or_more_levels": work["num_text_levels_present"].fillna(0).ge(2),
-    }
     for (target_name, horizon), target_group in work.groupby(["target_name", "horizon"]):
+        has_any = target_group["has_any_news_text"].fillna(0).astype(bool)
+        has_macro = target_group["has_text_macro"].fillna(0).astype(bool)
+        has_sector = target_group["has_text_sector"].fillna(0).astype(bool)
+        has_related = target_group["has_text_related"].fillna(0).astype(bool)
+        has_target = target_group["has_text_target"].fillna(0).astype(bool)
+        groups = {
+            "no_text": ~has_any,
+            "macro_or_sector_only": (has_macro | has_sector) & ~(has_related | has_target),
+            "related_company_text": has_related,
+            "target_company_text": has_target,
+            "two_or_more_levels": target_group["num_text_levels_present"].fillna(0).ge(2),
+        }
         for group_name, mask in groups.items():
-            subset = target_group[mask.loc[target_group.index]]
+            subset = target_group.loc[mask.astype(bool)]
             base = subset[subset["model"] == DEFAULT_BASELINE].set_index("row_id")
             comp = subset[subset["model"] == text_model].set_index("row_id")
             aligned = comp.join(base[["prediction"]].rename(columns={"prediction": "baseline_prediction"}), how="inner")
