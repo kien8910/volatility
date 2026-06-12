@@ -1,0 +1,8 @@
+pandas
+numpy
+scikit-learn
+datasets
+sentence-transformers
+matplotlib
+tqdm
+lightgbm
