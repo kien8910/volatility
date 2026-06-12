@@ -11,7 +11,7 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import PCA
 
-from .config import DEFAULT_CACHE_DIR, DEFAULT_EMBEDDING_MODEL, TEXT_COLUMNS, TEXT_KEYWORDS
+from .config import DEFAULT_CACHE_DIR, DEFAULT_EMBEDDING_MODEL, EVENT_KEYWORDS, TEXT_COLUMNS, TEXT_KEYWORDS
 
 TEXT_MODES = ["no_text", "all_text", "target_sector_text", "levelwise_text"]
 
@@ -36,8 +36,14 @@ def add_text_presence_flags(df: pd.DataFrame, text_columns: dict[str, list[str]]
         cols = text_columns.get(level, [])
         if not cols:
             out[f"has_text_{level}"] = False
+            out[f"text_length_{level}"] = 0
             continue
-        out[f"has_text_{level}"] = out[cols].fillna("").astype(str).agg(" ".join, axis=1).str.strip().ne("")
+        text = out[cols].fillna("").astype(str).agg(" ".join, axis=1).str.strip()
+        out[f"has_text_{level}"] = text.ne("")
+        out[f"text_length_{level}"] = text.str.len()
+    out["has_any_text"] = out[[f"has_text_{level}" for level in ["macro", "sector", "related", "target"]]].any(axis=1)
+    out["num_text_levels_present"] = out[[f"has_text_{level}" for level in ["macro", "sector", "related", "target"]]].sum(axis=1)
+    out["total_text_length"] = out[[f"text_length_{level}" for level in ["macro", "sector", "related", "target"]]].sum(axis=1)
     return out
 
 
@@ -45,6 +51,32 @@ def _join_columns(df: pd.DataFrame, columns: list[str]) -> pd.Series:
     if not columns:
         return pd.Series([""] * len(df), index=df.index)
     return df[columns].fillna("").astype(str).agg(" ".join, axis=1)
+
+
+def text_columns_for_configuration(text_columns: dict[str, list[str]], configuration: str) -> list[str]:
+    level_map = {
+        "macro_only": ["macro"],
+        "sector_only": ["sector"],
+        "related_only": ["related"],
+        "target_only": ["target"],
+        "macro_sector": ["macro", "sector"],
+        "target_sector": ["target", "sector"],
+        "target_related": ["target", "related"],
+        "all_text": ["macro", "sector", "related", "target"],
+        "levelwise_text": ["macro", "sector", "related", "target"],
+    }
+    if configuration == "no_text":
+        return []
+    if configuration not in level_map:
+        raise ValueError(f"Unknown text configuration: {configuration}")
+    cols: list[str] = []
+    for level in level_map[configuration]:
+        cols.extend(text_columns.get(level, []))
+    return sorted(set(cols))
+
+
+def joined_text_for_configuration(df: pd.DataFrame, text_columns: dict[str, list[str]], configuration: str) -> pd.Series:
+    return _join_columns(df, text_columns_for_configuration(text_columns, configuration))
 
 
 def build_text_by_mode(df: pd.DataFrame, text_columns: dict[str, list[str]], mode: str) -> list[pd.Series]:
@@ -61,6 +93,25 @@ def build_text_by_mode(df: pd.DataFrame, text_columns: dict[str, list[str]], mod
     raise ValueError(f"Unknown text mode: {mode}")
 
 
+def add_event_keyword_features(df: pd.DataFrame, text_columns: dict[str, list[str]]) -> pd.DataFrame:
+    out = df.copy()
+    all_text = joined_text_for_configuration(out, text_columns, "all_text").str.lower()
+    target_text = joined_text_for_configuration(out, text_columns, "target_only").str.lower()
+    total_hits = pd.Series(0, index=out.index)
+    target_hits = pd.Series(0, index=out.index)
+    for group, keywords in EVENT_KEYWORDS.items():
+        pattern = "|".join([keyword.lower().replace(" ", r"\s+") for keyword in keywords])
+        out[f"event_keyword_{group}"] = all_text.str.contains(pattern, regex=True, na=False)
+        out[f"target_event_keyword_{group}"] = target_text.str.contains(pattern, regex=True, na=False)
+        total_hits += out[f"event_keyword_{group}"].astype(int)
+        target_hits += out[f"target_event_keyword_{group}"].astype(int)
+    out["event_keyword_count"] = total_hits
+    out["target_event_keyword_count"] = target_hits
+    out["has_event_keyword"] = total_hits.gt(0)
+    out["has_target_event_keyword"] = target_hits.gt(0)
+    return out
+
+
 def _cache_path(cache_dir: Path, model_name: str, texts: pd.Series, pca_dim: int | None, suffix: str) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -71,6 +122,10 @@ def _cache_path(cache_dir: Path, model_name: str, texts: pd.Series, pca_dim: int
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return cache_dir / f"embeddings_{digest}.npy"
+
+
+def _raw_cache_path(cache_dir: Path, model_name: str, texts: pd.Series, suffix: str) -> Path:
+    return _cache_path(cache_dir, model_name, texts, None, f"raw_{suffix}")
 
 
 def _encode_series(
@@ -91,6 +146,64 @@ def _encode_series(
         raw = PCA(n_components=n_components, random_state=42).fit_transform(raw)
     np.save(path, raw)
     return raw
+
+
+def encode_text_raw(
+    texts: pd.Series,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    suffix: str = "detail",
+) -> np.ndarray:
+    """Encode text with cache, without PCA, so PCA can be fit on train only."""
+    cache_path = _raw_cache_path(Path(cache_dir), embedding_model, texts, suffix)
+    if cache_path.exists():
+        return np.load(cache_path)
+    model = SentenceTransformer(embedding_model)
+    matrix = model.encode(texts.fillna("").astype(str).tolist(), show_progress_bar=True, convert_to_numpy=True, normalize_embeddings=True)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, matrix)
+    return matrix
+
+
+def train_only_pca_features(
+    raw_matrix: np.ndarray,
+    train_index: pd.Index,
+    pca_dim: int | None,
+    prefix: str,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Fit PCA on train rows only, then transform all rows."""
+    if raw_matrix.size == 0:
+        return pd.DataFrame(index=train_index), []
+    n_features = raw_matrix.shape[1]
+    if pca_dim and 0 < pca_dim < n_features:
+        n_components = min(pca_dim, len(train_index), n_features)
+        pca = PCA(n_components=n_components, random_state=random_state)
+        pca.fit(raw_matrix[train_index.to_numpy()])
+        matrix = pca.transform(raw_matrix)
+    else:
+        matrix = raw_matrix
+    names = [f"{prefix}_emb_{i}" for i in range(matrix.shape[1])]
+    return pd.DataFrame(matrix, columns=names), names
+
+
+def keyword_filtered_text(
+    df: pd.DataFrame,
+    text_columns: dict[str, list[str]],
+    keyword_group: str | None = None,
+    target_only: bool = False,
+) -> pd.Series:
+    config = "target_only" if target_only else "all_text"
+    text = joined_text_for_configuration(df, text_columns, config)
+    if keyword_group is None:
+        keywords = [kw for values in EVENT_KEYWORDS.values() for kw in values]
+    else:
+        keywords = EVENT_KEYWORDS.get(keyword_group, [])
+    if not keywords:
+        return pd.Series([""] * len(df), index=df.index)
+    pattern = "|".join([keyword.lower().replace(" ", r"\s+") for keyword in keywords])
+    mask = text.str.lower().str.contains(pattern, regex=True, na=False)
+    return text.where(mask, "")
 
 
 def make_text_features(

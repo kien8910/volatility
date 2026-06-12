@@ -23,8 +23,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding_model", default=DEFAULT_EMBEDDING_MODEL)
     parser.add_argument("--pca_dim", type=int, default=64)
     parser.add_argument("--forecast_horizon", type=int, default=1)
+    parser.add_argument("--forecast_horizons", nargs="+", type=int, default=[1, 2, 3, 5])
+    parser.add_argument("--targets", nargs="+", default=["log_gk", "total_volatility", "log_abs_return"])
     parser.add_argument("--max_lag", type=int, default=22)
     parser.add_argument("--output_dir", default="outputs")
+    parser.add_argument("--analysis_mode", choices=["pilot", "detailed_news_signal"], default="pilot")
+    parser.add_argument("--evaluation_mode", choices=["fixed", "walk_forward"], default="fixed")
+    parser.add_argument("--quick_mode", action="store_true")
+    parser.add_argument("--run_placebo_tests", action="store_true")
+    parser.add_argument("--run_event_keyword_filter", action="store_true")
+    parser.add_argument("--run_statistical_tests", action="store_true")
     return parser.parse_args()
 
 
@@ -156,6 +164,12 @@ def plot_outputs(results: pd.DataFrame, predictions: pd.DataFrame, ticker_col: s
 
 def main() -> None:
     args = parse_args()
+    if args.analysis_mode == "detailed_news_signal":
+        from .detailed_news_signal import run_detailed_news_signal
+
+        run_detailed_news_signal(args)
+        return
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

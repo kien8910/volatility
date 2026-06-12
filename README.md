@@ -40,6 +40,59 @@ python -m src.run_pilot \
   --output_dir outputs
 ```
 
+## Detailed News Signal Analysis
+
+The detailed mode checks whether FinTexTS news has predictive association in specific tickers, event days, text levels, targets, and horizons. It keeps the original pilot outputs and adds ticker-level metrics, text-level ablations, event/spike diagnostics, placebo tests, alignment sensitivity, and an automatic report.
+
+Quick 5-ticker run:
+
+```bash
+python -m src.run_pilot \
+  --num_tickers 5 \
+  --analysis_mode detailed_news_signal \
+  --forecast_horizons 1 3 \
+  --targets log_gk total_volatility \
+  --quick_mode \
+  --run_placebo_tests \
+  --run_event_keyword_filter \
+  --output_dir outputs/detailed_signal
+```
+
+Fuller diagnostic run:
+
+```bash
+python -m src.run_pilot \
+  --num_tickers 5 \
+  --analysis_mode detailed_news_signal \
+  --forecast_horizons 1 2 3 5 \
+  --targets log_gk total_volatility log_abs_return \
+  --evaluation_mode fixed \
+  --run_placebo_tests \
+  --run_event_keyword_filter \
+  --run_statistical_tests \
+  --output_dir outputs/detailed_signal
+```
+
+Detailed mode writes stable-schema outputs including:
+
+- `outputs/detailed_signal/news_signal_by_ticker.csv`
+- `outputs/detailed_signal/ticker_improvement_summary.csv`
+- `outputs/detailed_signal/text_level_ablation.csv`
+- `outputs/detailed_signal/event_day_forecast_comparison.csv`
+- `outputs/detailed_signal/event_day_volatility_statistics.csv`
+- `outputs/detailed_signal/volatility_spike_analysis.csv`
+- `outputs/detailed_signal/news_lead_lag_analysis.csv`
+- `outputs/detailed_signal/text_signal_regression.csv`
+- `outputs/detailed_signal/event_keyword_filter_results.csv`
+- `outputs/detailed_signal/text_intensity_analysis.csv`
+- `outputs/detailed_signal/text_placebo_tests.csv`
+- `outputs/detailed_signal/text_alignment_sensitivity.csv`
+- `outputs/detailed_signal/statistical_tests.csv`
+- `outputs/detailed_signal/walk_forward_results.csv`
+- `outputs/detailed_signal/news_signal_report.md`
+
+The report gives a conservative recommendation: `proceed_with_agents`, `run_larger_pilot`, `revise_target_or_alignment`, or `stop_agent_development`. It does not claim that news helps unless the diagnostics support that.
+
 ## Outputs
 
 The pipeline writes:
@@ -51,6 +104,19 @@ The pipeline writes:
 - `outputs/model_comparison_rmse.png`
 - `outputs/model_comparison_mae.png`
 - `outputs/example_predictions_<ticker>.png`
+
+Detailed mode also creates:
+
+- `news_signal_by_ticker_mae.png`
+- `text_level_ablation_heatmap.png`
+- `event_day_error_comparison.png`
+- `spike_error_comparison.png`
+- `spike_rate_by_text_level.png`
+- `spike_prediction_metrics.png`
+- `news_lead_lag_heatmap.png`
+- `correct_vs_placebo_text.png`
+- `target_comparison.png`
+- `example_event_predictions_<ticker>.png`
 
 ## Reading Results
 
