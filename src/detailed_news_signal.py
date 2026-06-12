@@ -729,7 +729,17 @@ def text_intensity_analysis(predictions: pd.DataFrame, df: pd.DataFrame, output_
     return result
 
 
-def placebo_tests(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame, specs: list[TargetSpec], ticker_col: str, ts_features: list[str], args, output_dir: Path) -> pd.DataFrame:
+def placebo_tests(
+    df: pd.DataFrame,
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    specs: list[TargetSpec],
+    ticker_col: str,
+    date_col: str,
+    ts_features: list[str],
+    args,
+    output_dir: Path,
+) -> pd.DataFrame:
     rng = np.random.default_rng(RANDOM_SEED)
     rows = []
     base_cols = [f"has_text_{level}" for level in NEWS_LEVELS] + [f"text_length_{level}" for level in NEWS_LEVELS] + ["total_text_length", "num_text_levels_present"]
@@ -738,9 +748,22 @@ def placebo_tests(df: pd.DataFrame, train: pd.DataFrame, test: pd.DataFrame, spe
     for _, idx in shuffled.groupby(ticker_col).groups.items():
         shuffled.loc[idx, base_cols] = shuffled.loc[idx, base_cols].iloc[rng.permutation(len(idx))].to_numpy()
     variants["shuffled_text"] = shuffled[base_cols]
-    cross = df[[ticker_col] + base_cols].copy()
-    cross[base_cols] = cross.groupby(df.index).transform(lambda x: x)
-    variants["cross_ticker_text"] = df.groupby(df.index % max(1, df[ticker_col].nunique()))[base_cols].transform("mean")
+
+    cross = df[base_cols].copy()
+    if date_col in df.columns:
+        for _, idx in df.groupby(date_col, sort=False).groups.items():
+            idx_list = list(idx)
+            if len(idx_list) <= 1:
+                continue
+            perm = rng.permutation(len(idx_list))
+            if np.array_equal(perm, np.arange(len(idx_list))):
+                perm = np.roll(perm, 1)
+            cross.loc[idx_list, base_cols] = df.loc[idx_list, base_cols].iloc[perm].to_numpy()
+    else:
+        perm = rng.permutation(len(cross))
+        cross.loc[:, base_cols] = df[base_cols].iloc[perm].to_numpy()
+    variants["cross_ticker_text"] = cross[base_cols]
+
     stale = df.groupby(ticker_col, sort=False)[base_cols].shift(20).fillna(0)
     variants["stale_text"] = stale
     for variant, frame in variants.items():
@@ -1215,7 +1238,7 @@ def run_detailed_news_signal(args) -> None:
         pd.DataFrame().to_csv(output_dir / "event_keyword_filter_results.csv", index=False)
     intensity = text_intensity_analysis(predictions, df, output_dir)
     if args.run_placebo_tests:
-        placebo = placebo_tests(df, train_full, test, specs, column_map.ticker, ts_features, args, output_dir)
+        placebo = placebo_tests(df, train_full, test, specs, column_map.ticker, column_map.date, ts_features, args, output_dir)
     else:
         placebo = pd.DataFrame()
         placebo.to_csv(output_dir / "text_placebo_tests.csv", index=False)

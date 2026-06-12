@@ -5,6 +5,7 @@ import pandas as pd
 
 from src.features import add_detailed_volatility_targets, add_volatility_features, target_column_for
 from src.load_data import ColumnMap
+from src.detailed_news_signal import placebo_tests, TargetSpec
 from src.text_features import (
     combine_text_columns,
     joined_text_for_configuration,
@@ -119,3 +120,34 @@ def test_joined_text_configuration_does_not_emit_none_tokens() -> None:
     assert joined_text_for_configuration(df, text_columns, "news_all").iloc[0] == "target news"
     assert "filing context" not in joined_text_for_configuration(df, text_columns, "news_all").iloc[0]
     assert "filing context" in joined_text_for_configuration(df, text_columns, "news_plus_filing").iloc[0]
+
+
+def test_placebo_cross_ticker_variant_preserves_feature_shape(tmp_path) -> None:
+    df = pd.DataFrame(
+        {
+            "ticker": ["A", "B", "A", "B", "A", "B"],
+            "date": pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02", "2024-01-03", "2024-01-03"]),
+            "row_id": range(6),
+            "har_daily": [1, 1, 1, 1, 1, 1],
+            "har_weekly": [1, 1, 1, 1, 1, 1],
+            "har_monthly": [1, 1, 1, 1, 1, 1],
+            "log_return": [0, 0, 0, 0, 0, 0],
+            "logGKVol_lag_1": [1, 1, 1, 1, 1, 1],
+            "target": [1, 2, 1, 2, 1, 2],
+            "has_text_macro": [1, 0, 1, 0, 1, 0],
+            "has_text_sector": [0, 1, 0, 1, 0, 1],
+            "has_text_related": [0, 0, 0, 0, 0, 0],
+            "has_text_target": [1, 1, 1, 1, 1, 1],
+            "text_length_macro": [10, 0, 10, 0, 10, 0],
+            "text_length_sector": [0, 8, 0, 8, 0, 8],
+            "text_length_related": [0, 0, 0, 0, 0, 0],
+            "text_length_target": [5, 5, 5, 5, 5, 5],
+            "total_text_length": [15, 13, 15, 13, 15, 13],
+            "num_text_levels_present": [2, 2, 2, 2, 2, 2],
+        }
+    )
+    train = df.iloc[:4]
+    test = df.iloc[4:]
+    specs = [TargetSpec("log_gk", 1, "target")]
+    result = placebo_tests(df, train, test, specs, "ticker", "date", ["har_daily", "har_weekly", "har_monthly", "log_return", "logGKVol_lag_1"], None, tmp_path)
+    assert set(result["placebo_variant"]) == {"correct_text", "no_text", "shuffled_text", "cross_ticker_text", "stale_text"}
