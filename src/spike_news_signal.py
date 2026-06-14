@@ -23,6 +23,8 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from .config import DEFAULT_EMBEDDING_MODEL, RANDOM_SEED
 from .detailed_news_signal import TargetSpec, split_by_time
@@ -264,7 +266,20 @@ def run_spike_classifier_tests(
                 te["is_spike"] = (te[spec.column] > te["threshold"]).astype(int)
                 if tr["is_spike"].nunique() < 2 or te["is_spike"].nunique() < 2:
                     continue
-                model = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=RANDOM_SEED)
+                model = Pipeline(
+                    [
+                        ("scale", StandardScaler()),
+                        (
+                            "logit",
+                            LogisticRegression(
+                                max_iter=5000,
+                                class_weight="balanced",
+                                random_state=RANDOM_SEED,
+                                solver="liblinear",
+                            ),
+                        ),
+                    ]
+                )
                 # Keep ticker out of the classifier to avoid sparse one-hot plumbing; this is a lightweight signal test.
                 model.fit(tr[features], tr["is_spike"])
                 score = pd.Series(model.predict_proba(te[features])[:, 1], index=te.index)
