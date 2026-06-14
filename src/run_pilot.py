@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets", nargs="+", default=["log_gk", "total_volatility", "log_abs_return"])
     parser.add_argument("--max_lag", type=int, default=22)
     parser.add_argument("--output_dir", default="outputs")
-    parser.add_argument("--analysis_mode", choices=["pilot", "detailed_news_signal"], default="pilot")
+    parser.add_argument("--analysis_mode", choices=["pilot", "detailed_news_signal", "spike_news_signal"], default="pilot")
     parser.add_argument("--evaluation_mode", choices=["fixed", "walk_forward"], default="fixed")
     parser.add_argument("--quick_mode", action="store_true")
     parser.add_argument("--run_placebo_tests", action="store_true")
@@ -168,6 +168,11 @@ def main() -> None:
         from .detailed_news_signal import run_detailed_news_signal
 
         run_detailed_news_signal(args)
+        return
+    if args.analysis_mode == "spike_news_signal":
+        from .spike_news_signal import run_spike_news_signal_tests
+
+        run_spike_news_signal_tests(args)
         return
 
     output_dir = Path(args.output_dir)

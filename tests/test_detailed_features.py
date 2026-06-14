@@ -6,6 +6,7 @@ import pandas as pd
 from src.features import add_detailed_volatility_targets, add_volatility_features, target_column_for
 from src.load_data import ColumnMap
 from src.detailed_news_signal import placebo_tests, TargetSpec
+from src.spike_news_signal import _alignment_frame, _variant_frame, spike_threshold_sensitivity
 from src.text_features import (
     combine_text_columns,
     joined_text_for_configuration,
@@ -151,3 +152,36 @@ def test_placebo_cross_ticker_variant_preserves_feature_shape(tmp_path) -> None:
     specs = [TargetSpec("log_gk", 1, "target")]
     result = placebo_tests(df, train, test, specs, "ticker", "date", ["har_daily", "har_weekly", "har_monthly", "log_return", "logGKVol_lag_1"], None, tmp_path)
     assert set(result["placebo_variant"]) == {"correct_text", "no_text", "shuffled_text", "cross_ticker_text", "stale_text"}
+
+
+def test_spike_threshold_sensitivity_uses_train_only_threshold() -> None:
+    train = pd.DataFrame({"ticker": ["A"] * 5, "target": [1, 2, 3, 4, 100]})
+    test = pd.DataFrame({"ticker": ["A"] * 2, "target": [5, 101]})
+    specs = [TargetSpec("log_gk", 1, "target")]
+    result, thresholds = spike_threshold_sensitivity(train, test, specs, "ticker")
+    threshold_90 = thresholds[("log_gk", 1, 90)].loc["A", "threshold"]
+    assert threshold_90 == train["target"].quantile(0.90)
+    row_90 = result[result["spike_percentile"].eq(90)].iloc[0]
+    assert row_90["spike_count"] == 1
+
+
+def test_spike_news_cross_ticker_variant_keeps_shape() -> None:
+    df = pd.DataFrame(
+        {
+            "ticker": ["A", "B", "A", "B"],
+            "date": pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"]),
+            "has_text_macro": [1, 0, 1, 0],
+            "text_length_macro": [10, 20, 30, 40],
+        }
+    )
+    out = _variant_frame(df, ["has_text_macro", "text_length_macro"], "ticker", "date", "cross_ticker_same_day")
+    assert out.shape == (4, 2)
+    assert sorted(out["text_length_macro"].tolist()) == [10, 20, 30, 40]
+
+
+def test_spike_alignment_windows_are_backward_looking() -> None:
+    df = pd.DataFrame({"ticker": ["A"] * 4, "x": [0, 1, 0, 0]})
+    shifted = _alignment_frame(df, ["x"], "ticker", "shifted_1_day_text")
+    window = _alignment_frame(df, ["x"], "ticker", "window_3d_text")
+    assert shifted["x"].tolist() == [0, 0, 1, 0]
+    assert window["x"].tolist() == [0.0, 1.0, 1.0, 1.0]
