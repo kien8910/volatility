@@ -78,6 +78,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_lag", type=int, default=22)
     parser.add_argument("--cache_dir", default=str(DEFAULT_CACHE_DIR))
     parser.add_argument("--output_dir", default="outputs/spike_controlled_embedding")
+    parser.add_argument(
+        "--require_target_event_keyword",
+        action="store_true",
+        help="Evaluate only rows where target-company text contains at least one configured event keyword.",
+    )
     return parser.parse_args()
 
 
@@ -276,6 +281,8 @@ def evaluate_variant(
     for spec in specs:
         tr = train.dropna(subset=feature_cols + [spec.column])
         te = test.dropna(subset=feature_cols + [spec.column])
+        if args.require_target_event_keyword:
+            te = te[te["target_event_keyword_count"].fillna(0).gt(0)]
         if tr.empty or te.empty:
             continue
         ts_pred = fit_predict_ridge(tr, te, ts_features, args._ticker_col, spec.column)
@@ -314,6 +321,7 @@ def evaluate_variant(
                             "embedding_variant": embedding_variant,
                             "alignment_mode": alignment_mode,
                             "placebo_variant": placebo_variant,
+                            "evaluation_filter": "target_event_keyword" if args.require_target_event_keyword else "all_test_rows",
                             "num_test_spikes": int(te_cls.loc[idx_list, "is_spike"].sum()),
                             "num_test_samples": int(len(idx_list)),
                             **metrics,
@@ -335,6 +343,7 @@ def evaluate_variant(
                         "embedding_variant": embedding_variant,
                         "alignment_mode": alignment_mode,
                         "placebo_variant": placebo_variant,
+                        "evaluation_filter": "target_event_keyword" if args.require_target_event_keyword else "all_test_rows",
                         "num_spike_samples": int(len(spike)),
                         "ts_only_mae": ts_mae,
                         "embedding_mae": emb_mae,
@@ -355,6 +364,7 @@ def evaluate_variant(
                             "spike_percentile": pct,
                             "embedding_variant": embedding_variant,
                             "alignment_mode": alignment_mode,
+                            "evaluation_filter": "target_event_keyword" if args.require_target_event_keyword else "all_test_rows",
                             "actual_target": row[spec.column],
                             "threshold": row["threshold"],
                             "ts_only_prediction": row["ts_only_prediction"],
