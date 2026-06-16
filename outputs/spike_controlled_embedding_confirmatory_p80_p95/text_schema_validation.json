@@ -1,0 +1,52 @@
+{
+  "expected_columns": [
+    "macro_category1",
+    "macro_category2",
+    "macro_category3",
+    "macro_category4",
+    "macro_category5",
+    "sector_category1",
+    "sector_category2",
+    "sector_category3",
+    "sector_category4",
+    "sector_category5",
+    "relatedCompany_category1",
+    "relatedCompany_category2",
+    "relatedCompany_category3",
+    "targetCompany_category1",
+    "targetCompany_category2",
+    "targetCompany_category3",
+    "filing_financialStatement",
+    "filing_governanceRisks",
+    "filing_overviewProduct",
+    "filing_recentEventCatalyst",
+    "filing_strategyMarketOps"
+  ],
+  "found_columns": [
+    "macro_category1",
+    "macro_category2",
+    "macro_category3",
+    "macro_category4",
+    "macro_category5",
+    "sector_category1",
+    "sector_category2",
+    "sector_category3",
+    "sector_category4",
+    "sector_category5",
+    "relatedCompany_category1",
+    "relatedCompany_category2",
+    "relatedCompany_category3",
+    "targetCompany_category1",
+    "targetCompany_category2",
+    "targetCompany_category3",
+    "filing_financialStatement",
+    "filing_governanceRisks",
+    "filing_overviewProduct",
+    "filing_recentEventCatalyst",
+    "filing_strategyMarketOps"
+  ],
+  "missing_columns": [],
+  "extra_possible_text_columns": [
+    "ticker"
+  ]
+}
