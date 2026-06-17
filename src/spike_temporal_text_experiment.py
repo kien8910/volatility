@@ -204,11 +204,59 @@ def _gate_mask(df: pd.DataFrame, gate_type: str) -> pd.Series:
     raise ValueError(f"Unknown gate_type: {gate_type}")
 
 
-def _prediction_metrics(actual: pd.Series, pred: pd.Series) -> dict[str, float]:
+def _prediction_metrics(actual: pd.Series, pred: pd.Series, threshold: pd.Series | None = None) -> dict[str, float]:
     mae = float(mean_absolute_error(actual, pred))
+    mse = float(mean_squared_error(actual, pred))
     rmse = float(np.sqrt(mean_squared_error(actual, pred)))
-    under = float((actual - pred).clip(lower=0).mean())
-    return {"mae": mae, "rmse": rmse, "underprediction_loss": under}
+    error = pred - actual
+    abs_error = error.abs()
+    under_error = (actual - pred).clip(lower=0)
+    over_error = (pred - actual).clip(lower=0)
+
+    # QLIKE is usually defined for variance forecasts. These targets are mostly
+    # log-volatility or log-absolute-return proxies, so exponentiating provides a
+    # positive realized/forecast variance proxy without changing model training.
+    actual_var = np.square(np.exp(actual.clip(lower=-30, upper=30)))
+    pred_var = np.square(np.exp(pred.clip(lower=-30, upper=30))).clip(lower=1e-12)
+    qlike = np.log(pred_var) + actual_var / pred_var
+
+    out = {
+        "mae": mae,
+        "mse": mse,
+        "rmse": rmse,
+        "median_abs_error": float(abs_error.median()),
+        "bias": float(error.mean()),
+        "mean_error": float(error.mean()),
+        "underprediction_loss": float(under_error.mean()),
+        "overprediction_loss": float(over_error.mean()),
+        "underprediction_rate": float((pred < actual).mean()),
+        "asymmetric_under_2x_loss": float((2.0 * under_error + over_error).mean()),
+        "qlike_proxy_loss": float(qlike.mean()),
+    }
+    if threshold is not None and threshold.notna().any():
+        aligned_threshold = threshold.reindex(actual.index)
+        valid = aligned_threshold.notna() & actual.notna() & pred.notna()
+        if valid.any():
+            actual_spike = actual.loc[valid] > aligned_threshold.loc[valid]
+            predicted_spike = pred.loc[valid] > aligned_threshold.loc[valid]
+            tp = int((actual_spike & predicted_spike).sum())
+            fp = int((~actual_spike & predicted_spike).sum())
+            fn = int((actual_spike & ~predicted_spike).sum())
+            tn = int((~actual_spike & ~predicted_spike).sum())
+            precision = tp / (tp + fp) if (tp + fp) else np.nan
+            recall = tp / (tp + fn) if (tp + fn) else np.nan
+            false_alarm = fp / (fp + tn) if (fp + tn) else np.nan
+            f1 = 2 * precision * recall / (precision + recall) if precision == precision and recall == recall and (precision + recall) else np.nan
+            out.update(
+                {
+                    "predicted_spike_rate": float(predicted_spike.mean()),
+                    "spike_precision": float(precision) if precision == precision else np.nan,
+                    "spike_recall": float(recall) if recall == recall else np.nan,
+                    "spike_f1": float(f1) if f1 == f1 else np.nan,
+                    "false_alarm_rate": float(false_alarm) if false_alarm == false_alarm else np.nan,
+                }
+            )
+    return out
 
 
 def _evaluate_predictions(
@@ -243,13 +291,20 @@ def _evaluate_predictions(
                 group = group.loc[valid]
                 idx = group.index
                 model_pred = model_pred.loc[idx]
-                metrics = _prediction_metrics(group[target_col], model_pred)
+                metrics = _prediction_metrics(group[target_col], model_pred, group["threshold"])
                 har_mae = np.nan
+                har_rmse = np.nan
+                har_under = np.nan
+                har_qlike = np.nan
                 if har_pred is not None:
                     har_values = har_pred.loc[idx]
                     har_valid = har_values.notna() & group[target_col].notna()
                     if har_valid.any():
-                        har_mae = float(mean_absolute_error(group.loc[har_valid, target_col], har_values.loc[har_valid]))
+                        har_metrics = _prediction_metrics(group.loc[har_valid, target_col], har_values.loc[har_valid], group.loc[har_valid, "threshold"])
+                        har_mae = har_metrics["mae"]
+                        har_rmse = har_metrics["rmse"]
+                        har_under = har_metrics["underprediction_loss"]
+                        har_qlike = har_metrics["qlike_proxy_loss"]
                 rows.append(
                     {
                         "ticker": ticker,
@@ -264,7 +319,13 @@ def _evaluate_predictions(
                         **extra,
                         **metrics,
                         "har_mae": har_mae,
+                        "har_rmse": har_rmse,
+                        "har_underprediction_loss": har_under,
+                        "har_qlike_proxy_loss": har_qlike,
                         "mae_improvement_vs_har_pct": (har_mae - metrics["mae"]) / har_mae * 100 if har_mae else np.nan,
+                        "rmse_improvement_vs_har_pct": (har_rmse - metrics["rmse"]) / har_rmse * 100 if har_rmse else np.nan,
+                        "underprediction_improvement_vs_har": har_under - metrics["underprediction_loss"] if har_under == har_under else np.nan,
+                        "qlike_improvement_vs_har": har_qlike - metrics["qlike_proxy_loss"] if har_qlike == har_qlike else np.nan,
                     }
                 )
     return rows
@@ -371,6 +432,26 @@ def _write_summary(output_dir: Path, metrics: pd.DataFrame, args: argparse.Names
         )
         for model, row in guard.iterrows():
             lines.append(f"- {model}: mean={row['mean']:.2f}%, median={row['median']:.2f}% over {int(row['count'])} cases")
+        if "underprediction_improvement_vs_har" in spike.columns:
+            lines.extend(["", "## Spike Underprediction Reduction vs HAR", ""])
+            under = (
+                spike.groupby("model")["underprediction_improvement_vs_har"]
+                .agg(["count", "mean", "median"])
+                .sort_values("median", ascending=False)
+                .head(12)
+            )
+            for model, row in under.iterrows():
+                lines.append(f"- {model}: mean={row['mean']:.4f}, median={row['median']:.4f} over {int(row['count'])} cases")
+        if "qlike_improvement_vs_har" in spike.columns:
+            lines.extend(["", "## Spike QLIKE Proxy Improvement vs HAR", ""])
+            qlike = (
+                spike.groupby("model")["qlike_improvement_vs_har"]
+                .agg(["count", "mean", "median"])
+                .sort_values("median", ascending=False)
+                .head(12)
+            )
+            for model, row in qlike.iterrows():
+                lines.append(f"- {model}: mean={row['mean']:.4f}, median={row['median']:.4f} over {int(row['count'])} cases")
     lines.extend(
         [
             "",
@@ -379,10 +460,45 @@ def _write_summary(output_dir: Path, metrics: pd.DataFrame, args: argparse.Names
             "- Spike thresholds are computed on train rows per ticker.",
             "- Text residual correction is applied only when the configured gate is active.",
             "- PCA is fit on train rows only before transforming test rows.",
+            "- QLIKE is reported as a positive variance-proxy loss by exponentiating log-volatility/log-absolute-return targets.",
             "- same_day_text should be treated as an upper-bound unless intraday timestamps confirm availability before forecast cutoff.",
         ]
     )
     (output_dir / "temporal_text_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _financial_metric_summary(metrics: pd.DataFrame) -> pd.DataFrame:
+    if metrics.empty:
+        return pd.DataFrame()
+    group_cols = ["segment", "model", "embedding_variant", "alignment_mode", "gate_type"]
+    value_cols = [
+        "mae_improvement_vs_har_pct",
+        "rmse_improvement_vs_har_pct",
+        "underprediction_improvement_vs_har",
+        "qlike_improvement_vs_har",
+        "mae",
+        "rmse",
+        "underprediction_loss",
+        "asymmetric_under_2x_loss",
+        "qlike_proxy_loss",
+        "spike_precision",
+        "spike_recall",
+        "spike_f1",
+        "false_alarm_rate",
+    ]
+    available = [col for col in value_cols if col in metrics.columns]
+    summary = (
+        metrics.groupby(group_cols, dropna=False)[available]
+        .agg(["count", "mean", "median"])
+        .reset_index()
+    )
+    summary.columns = [
+        "_".join([str(part) for part in col if str(part)])
+        if isinstance(col, tuple)
+        else str(col)
+        for col in summary.columns
+    ]
+    return summary
 
 
 def run(args: argparse.Namespace) -> None:
@@ -543,6 +659,7 @@ def run(args: argparse.Namespace) -> None:
     metrics = pd.DataFrame(metric_rows)
     events = pd.DataFrame(event_rows)
     metrics.to_csv(output_dir / "temporal_text_metrics.csv", index=False)
+    _financial_metric_summary(metrics).to_csv(output_dir / "temporal_text_financial_metric_summary.csv", index=False)
     if not events.empty:
         events.to_csv(output_dir / "temporal_text_event_examples.csv", index=False)
         events.sort_values("abs_error_improvement", ascending=False).head(300).to_csv(output_dir / "temporal_text_top_improvements.csv", index=False)
